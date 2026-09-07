@@ -36,15 +36,12 @@ async function findPersonId(name) {
     return data.results && data.results.length > 0 ? data.results[0].id : null;
 }
 
-// Renvoie la liste des films ou cette personne est creditee comme actrice/acteur.
 async function getActorMovies(personId) {
     if (!personId) return null;
     const data = await tmdbFetch(`/person/${personId}/movie_credits`);
     return data.cast || [];
 }
 
-// Renvoie la liste des films que cette personne a reellement realises
-// (on filtre precisement sur job === "Director", pas juste "a un role technique").
 async function getDirectorMovies(personId) {
     if (!personId) return null;
     const data = await tmdbFetch(`/person/${personId}/movie_credits`);
@@ -90,17 +87,10 @@ function dedupeById(movies) {
     return out;
 }
 
-// Certaines fiches TMDB sont des entrees quasi vides / douteuses (0 vote,
-// aucune affiche, credits parfois errones) qui polluent les resultats sans
-// etre de vrais films connus (ex : "Civilware 2025"). On les ecarte.
 function isLikelyRealMovie(m) {
     return Boolean(m.poster_path) && (m.vote_count || 0) >= 1;
 }
 
-// TMDB ne fait qu'une recherche litterale sur les titres : une description
-// d'ambiance ("un film de braquage haletant") ne matche presque jamais un
-// titre. On complete donc avec un petit dictionnaire de themes courants
-// vers des genres, pour elargir la recherche libre au-dela du titre exact.
 const THEME_TO_GENRES = [
     { words: ["braquage", "casse", "hold-up", "holdup"], genres: [80, 53] },
     { words: ["espace", "spatial", "galaxie", "extraterrestre"], genres: [878] },
@@ -127,10 +117,6 @@ function genresFromFreeText(text) {
     return [...genres];
 }
 
-// Mots trop courants pour etre utiles a une recherche de mot-cle (ils
-// noient le vrai sujet de la phrase, ex: "dinosaures" dans "film avec des
-// dinosaures"). On les retire pour interroger aussi chaque mot important
-// separement, en plus de la phrase complete.
 const STOPWORDS_FR = new Set([
     "film", "films", "avec", "sans", "des", "un", "une", "de", "la", "le", "les",
     "du", "au", "aux", "et", "ou", "dans", "sur", "pour", "qui", "que", "quel",
@@ -144,9 +130,8 @@ async function keywordIdsFromFreeText(text) {
 
 try {
     const full = await tmdbFetch("/search/keyword", { query: text });
-    (full.results || []).slice(0, 3).forEach((k) => ids.add(k.id));
+    (full.results || []).slice(0, 5).forEach((k) => ids.add(k.id));
 } catch {
-    // on continue avec les mots individuels meme si la phrase complete echoue
 }
 
 const words = text
@@ -160,9 +145,9 @@ const results = await Promise.all(
         tmdbFetch("/search/keyword", { query: w }).catch(() => ({ results: [] }))
                     )
     );
-    results.forEach((r) => (r.results || []).slice(0, 2).forEach((k) => ids.add(k.id)));
+    results.forEach((r) => (r.results || []).slice(0, 6).forEach((k) => ids.add(k.id)));
 
-return [...ids].slice(0, 8);
+return [...ids].slice(0, 15);
 }
 
 export async function POST(request) {
@@ -181,25 +166,15 @@ export async function POST(request) {
         const hasKeywords = keywordsTrimmed.length > 0;
         const genreNum = body.genreId ? Number(body.genreId) : null;
 
-    // Nombre de films a renvoyer : 5, 10, ou "illimite" (en pratique on
-    // plafonne quand meme a 50, sinon la recherche devient tres lente et
-    // TMDB ne fournit de toute facon pas un nombre infini de films pertinents).
     const limitMap = { "5": 5, "10": 10, illimite: 50 };
         const limitNum = limitMap[body.limit] || 5;
-        // Nombre de pages TMDB (20 resultats/page) a recuperer pour avoir assez
-    // de candidats bruts avant filtrage, sans multiplier les appels inutilement.
-    const pageCount = Math.min(3, Math.max(1, Math.ceil(limitNum / 20)));
+        const pageCount = Math.min(3, Math.max(1, Math.ceil(limitNum / 20)));
 
-    // On resout les noms en identifiants TMDB, et on recupere directement
-    // la filmographie complete de chacun (fiable, pas d'ambiguite sur les roles).
     const [actorId, directorId] = await Promise.all([
         findPersonId(actorTrimmed),
         findPersonId(directorTrimmed),
         ]);
 
-    // Si un nom a ete saisi mais ne correspond a personne sur TMDB, mieux
-    // vaut le dire clairement que de proposer des films populaires sans
-    // rapport : on renvoie une liste vide plutot qu'un faux positif.
     if ((actorTrimmed && !actorId) || (directorTrimmed && !directorId)) {
         return NextResponse.json({ results: [] });
     }
@@ -211,9 +186,6 @@ export async function POST(request) {
         const actorMovieIds = actorMovies ? new Set(actorMovies.map((m) => m.id)) : null;
         const directorMovieIds = directorMovies ? new Set(directorMovies.map((m) => m.id)) : null;
 
-    // On choisit la liste de depart la plus pertinente, puis on la
-    // restreint avec chacun des autres criteres fournis (au lieu de ne
-    // combiner que deux criteres a la fois).
     let candidates;
         if (hasKeywords) {
             const searchData = await tmdbFetchPages(
@@ -223,9 +195,6 @@ export async function POST(request) {
                 );
             candidates = searchData;
 
-        // La recherche litterale TMDB rate souvent les descriptions d'ambiance :
-        // on complete avec les genres associes aux themes reconnus dans le texte,
-        // ainsi qu'avec les mots-cles TMDB correspondant au texte libre.
         const [inferredGenres, keywordIds] = await Promise.all([
             Promise.resolve(genresFromFreeText(keywordsTrimmed)),
             keywordIdsFromFreeText(keywordsTrimmed),
@@ -251,6 +220,7 @@ export async function POST(request) {
                 {
                     sort_by: "popularity.desc",
                     include_adult: "false",
+                    "vote_count.gte": "10",
                     with_keywords: keywordIds.join("|"),
                 },
                 pageCount
@@ -284,7 +254,6 @@ export async function POST(request) {
             candidates = candidates.filter((m) => m.genre_ids?.includes(genreNum));
         }
 
-    // Tri par popularite decroissante (les films les plus connus en premier).
     candidates.sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
 
     const topN = candidates.slice(0, limitNum);
