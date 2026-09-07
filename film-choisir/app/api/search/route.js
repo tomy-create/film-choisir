@@ -127,18 +127,42 @@ function genresFromFreeText(text) {
     return [...genres];
 }
 
-// Complement au dictionnaire de themes : on interroge directement les
-// "mots-cles" TMDB (ex : "dinosaur", "time travel"...) avec le texte libre
-// tel quel. La recherche de mots-cles TMDB tolere bien le francais proche
-// de l'anglais (ex : "dinosaure" retrouve le mot-cle "dinosaur"), ce qui
-// permet de couvrir plein de sujets precis sans dictionnaire a la main.
+// Mots trop courants pour etre utiles a une recherche de mot-cle (ils
+// noient le vrai sujet de la phrase, ex: "dinosaures" dans "film avec des
+// dinosaures"). On les retire pour interroger aussi chaque mot important
+// separement, en plus de la phrase complete.
+const STOPWORDS_FR = new Set([
+    "film", "films", "avec", "sans", "des", "un", "une", "de", "la", "le", "les",
+    "du", "au", "aux", "et", "ou", "dans", "sur", "pour", "qui", "que", "quel",
+    "quelle", "ca", "sa", "ses", "mon", "ma", "mes", "ton", "ta", "tes", "notre",
+    "nos", "votre", "vos", "leur", "leurs", "il", "elle", "ils", "elles", "est",
+    "sont", "tres", "plus", "comme", "style", "genre", "type", "quelque", "chose",
+    ]);
+
 async function keywordIdsFromFreeText(text) {
-    try {
-        const data = await tmdbFetch("/search/keyword", { query: text });
-        return (data.results || []).slice(0, 3).map((k) => k.id);
-    } catch {
-        return [];
-    }
+    const ids = new Set();
+
+try {
+    const full = await tmdbFetch("/search/keyword", { query: text });
+    (full.results || []).slice(0, 3).forEach((k) => ids.add(k.id));
+} catch {
+    // on continue avec les mots individuels meme si la phrase complete echoue
+}
+
+const words = text
+    .toLowerCase()
+    .split(/[^a-zàâäéèêëïîôöùûüç0-9-]+/i)
+    .filter((w) => w.length > 3 && !STOPWORDS_FR.has(w));
+    const uniqueWords = [...new Set(words)].slice(0, 4);
+
+const results = await Promise.all(
+    uniqueWords.map((w) =>
+        tmdbFetch("/search/keyword", { query: w }).catch(() => ({ results: [] }))
+                    )
+    );
+    results.forEach((r) => (r.results || []).slice(0, 2).forEach((k) => ids.add(k.id)));
+
+return [...ids].slice(0, 8);
 }
 
 export async function POST(request) {
