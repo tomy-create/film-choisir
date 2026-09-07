@@ -19,21 +19,32 @@ async function tmdbFetch(path, params = {}) {
     return res.json();
 }
 
+// Recupere plusieurs pages d'un meme endpoint TMDB pagine (utile quand on
+// veut plus de 20 resultats, la taille d'une page TMDB) et les concatene.
+async function tmdbFetchPages(path, params, pageCount) {
+    const pages = await Promise.all(
+        Array.from({ length: pageCount }, (_, i) =>
+            tmdbFetch(path, { ...params, page: String(i + 1) })
+                   )
+        );
+    return pages.flatMap((p) => p.results || []);
+}
+
 async function findPersonId(name) {
     if (!name || !name.trim()) return null;
     const data = await tmdbFetch("/search/person", { query: name });
     return data.results && data.results.length > 0 ? data.results[0].id : null;
 }
 
-// Renvoie la liste des films où cette personne est créditée comme actrice/acteur.
+// Renvoie la liste des films ou cette personne est creditee comme actrice/acteur.
 async function getActorMovies(personId) {
     if (!personId) return null;
     const data = await tmdbFetch(`/person/${personId}/movie_credits`);
     return data.cast || [];
 }
 
-// Renvoie la liste des films que cette personne a réellement réalisés
-// (on filtre precisément sur job === "Director", pas juste "a un rôle technique").
+// Renvoie la liste des films que cette personne a reellement realises
+// (on filtre precisement sur job === "Director", pas juste "a un role technique").
 async function getDirectorMovies(personId) {
     if (!personId) return null;
     const data = await tmdbFetch(`/person/${personId}/movie_credits`);
@@ -79,10 +90,17 @@ function dedupeById(movies) {
     return out;
 }
 
-// TMDB ne fait qu'une recherche littérale sur les titres : une description
+// Certaines fiches TMDB sont des entrees quasi vides / douteuses (0 vote,
+// aucune affiche, credits parfois errones) qui polluent les resultats sans
+// etre de vrais films connus (ex : "Civilware 2025"). On les ecarte.
+function isLikelyRealMovie(m) {
+    return Boolean(m.poster_path) && (m.vote_count || 0) >= 1;
+}
+
+// TMDB ne fait qu'une recherche litterale sur les titres : une description
 // d'ambiance ("un film de braquage haletant") ne matche presque jamais un
-// titre. On complète donc avec un petit dictionnaire de thèmes courants
-// vers des genres, pour élargir la recherche libre au-delà du titre exact.
+// titre. On complete donc avec un petit dictionnaire de themes courants
+// vers des genres, pour elargir la recherche libre au-dela du titre exact.
 const THEME_TO_GENRES = [
     { words: ["braquage", "casse", "hold-up", "holdup"], genres: [80, 53] },
     { words: ["espace", "spatial", "galaxie", "extraterrestre"], genres: [878] },
@@ -109,6 +127,20 @@ function genresFromFreeText(text) {
     return [...genres];
 }
 
+// Complement au dictionnaire de themes : on interroge directement les
+// "mots-cles" TMDB (ex : "dinosaur", "time travel"...) avec le texte libre
+// tel quel. La recherche de mots-cles TMDB tolere bien le francais proche
+// de l'anglais (ex : "dinosaure" retrouve le mot-cle "dinosaur"), ce qui
+// permet de couvrir plein de sujets precis sans dictionnaire a la main.
+async function keywordIdsFromFreeText(text) {
+    try {
+        const data = await tmdbFetch("/search/keyword", { query: text });
+        return (data.results || []).slice(0, 3).map((k) => k.id);
+    } catch {
+        return [];
+    }
+}
+
 export async function POST(request) {
     try {
         if (!process.env.TMDB_API_KEY) {
@@ -125,16 +157,25 @@ export async function POST(request) {
         const hasKeywords = keywordsTrimmed.length > 0;
         const genreNum = body.genreId ? Number(body.genreId) : null;
 
-    // On résout les noms en identifiants TMDB, et on récupère directement
-    // la filmographie complète de chacun (fiable, pas d'ambiguïté sur les rôles).
+    // Nombre de films a renvoyer : 5, 10, ou "illimite" (en pratique on
+    // plafonne quand meme a 50, sinon la recherche devient tres lente et
+    // TMDB ne fournit de toute facon pas un nombre infini de films pertinents).
+    const limitMap = { "5": 5, "10": 10, illimite: 50 };
+        const limitNum = limitMap[body.limit] || 5;
+        // Nombre de pages TMDB (20 resultats/page) a recuperer pour avoir assez
+    // de candidats bruts avant filtrage, sans multiplier les appels inutilement.
+    const pageCount = Math.min(3, Math.max(1, Math.ceil(limitNum / 20)));
+
+    // On resout les noms en identifiants TMDB, et on recupere directement
+    // la filmographie complete de chacun (fiable, pas d'ambiguite sur les roles).
     const [actorId, directorId] = await Promise.all([
         findPersonId(actorTrimmed),
         findPersonId(directorTrimmed),
         ]);
 
-    // Si un nom a été saisi mais ne correspond à personne sur TMDB, mieux
+    // Si un nom a ete saisi mais ne correspond a personne sur TMDB, mieux
     // vaut le dire clairement que de proposer des films populaires sans
-    // rapport : on renvoie une liste vide plutôt qu'un faux positif.
+    // rapport : on renvoie une liste vide plutot qu'un faux positif.
     if ((actorTrimmed && !actorId) || (directorTrimmed && !directorId)) {
         return NextResponse.json({ results: [] });
     }
@@ -146,26 +187,52 @@ export async function POST(request) {
         const actorMovieIds = actorMovies ? new Set(actorMovies.map((m) => m.id)) : null;
         const directorMovieIds = directorMovies ? new Set(directorMovies.map((m) => m.id)) : null;
 
-    // On choisit la liste de départ la plus pertinente, puis on la
-    // restreint avec chacun des autres critères fournis (au lieu de ne
-    // combiner que deux critères à la fois).
+    // On choisit la liste de depart la plus pertinente, puis on la
+    // restreint avec chacun des autres criteres fournis (au lieu de ne
+    // combiner que deux criteres a la fois).
     let candidates;
         if (hasKeywords) {
-            const data = await tmdbFetch("/search/movie", { query: keywordsTrimmed });
-            candidates = data.results || [];
+            const searchData = await tmdbFetchPages(
+                "/search/movie",
+                { query: keywordsTrimmed },
+                Math.min(pageCount, 2)
+                );
+            candidates = searchData;
 
-        // La recherche littérale TMDB rate souvent les descriptions d'ambiance :
-        // on complète avec les genres associés aux thèmes reconnus dans le texte.
-        const inferredGenres = genresFromFreeText(keywordsTrimmed);
-            if (inferredGenres.length > 0) {
-                const discoverData = await tmdbFetch("/discover/movie", {
+        // La recherche litterale TMDB rate souvent les descriptions d'ambiance :
+        // on complete avec les genres associes aux themes reconnus dans le texte,
+        // ainsi qu'avec les mots-cles TMDB correspondant au texte libre.
+        const [inferredGenres, keywordIds] = await Promise.all([
+            Promise.resolve(genresFromFreeText(keywordsTrimmed)),
+            keywordIdsFromFreeText(keywordsTrimmed),
+            ]);
+
+        if (inferredGenres.length > 0) {
+            const discoverByGenre = await tmdbFetchPages(
+                "/discover/movie",
+                {
                     sort_by: "popularity.desc",
                     include_adult: "false",
                     "vote_count.gte": "50",
                     with_genres: inferredGenres.join(","),
-                });
-                candidates = [...candidates, ...(discoverData.results || [])];
-            }
+                },
+                pageCount
+                );
+            candidates = [...candidates, ...discoverByGenre];
+        }
+
+        if (keywordIds.length > 0) {
+            const discoverByKeyword = await tmdbFetchPages(
+                "/discover/movie",
+                {
+                    sort_by: "popularity.desc",
+                    include_adult: "false",
+                    with_keywords: keywordIds.join("|"),
+                },
+                pageCount
+                );
+            candidates = [...candidates, ...discoverByKeyword];
+        }
         } else if (actorMovies) {
             candidates = actorMovies;
         } else if (directorMovies) {
@@ -177,11 +244,11 @@ export async function POST(request) {
                 "vote_count.gte": "50",
             };
             if (genreNum) discoverParams.with_genres = genreNum;
-            const data = await tmdbFetch("/discover/movie", discoverParams);
-            candidates = data.results || [];
+            candidates = await tmdbFetchPages("/discover/movie", discoverParams, pageCount);
         }
 
     candidates = dedupeById(candidates);
+        candidates = candidates.filter(isLikelyRealMovie);
 
     if (actorMovieIds) {
         candidates = candidates.filter((m) => actorMovieIds.has(m.id));
@@ -193,13 +260,13 @@ export async function POST(request) {
             candidates = candidates.filter((m) => m.genre_ids?.includes(genreNum));
         }
 
-    // Tri par popularité décroissante (les films les plus connus en premier).
+    // Tri par popularite decroissante (les films les plus connus en premier).
     candidates.sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
 
-    const top5 = candidates.slice(0, 5);
+    const topN = candidates.slice(0, limitNum);
 
     const enriched = await Promise.all(
-        top5.map(async (movie) => {
+        topN.map(async (movie) => {
             const imdbId = await getImdbId(movie.id);
             const ratings = await getRatings(imdbId);
             return {
